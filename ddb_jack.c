@@ -225,6 +225,9 @@ static int ddb_jack_init (void)
         plugin.free();
         return EACCES;
     }
+    else {
+        dbc->active = 1;
+    }
 
     // connect ports to hardware output
     if (dbc->autoconnect) {
@@ -259,15 +262,10 @@ static int ddb_jack_setformat(ddb_waveformat_t *fmt)
     /* Support only changing channels numbers */
     if (plugin.fmt.channels == fmt->channels)
         return 0;
-    else
-        plugin.fmt.channels = fmt->channels;
 
     if (ddb_client.active) {
-        if (ddb_playback_stop())
-            return EPERM;
-        if (jack_client_close(ddb_client.client))
-            return ESRCH;
-        ddb_client.active = 0;
+        /* FIXME: just return and let the user restart deadbeef for now */
+        return 0;
     }
     if(!ddb_jack_init())
         return ENOEXEC;
