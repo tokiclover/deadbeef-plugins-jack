@@ -9,8 +9,10 @@
 #  include <config.h>
 #endif
 
-#define JACK_CLIENT_NAME "deadbeef"
+#define DB_CLIENT_NAME "deadbeef"
+#define DB_PLUG_NAME "ddb_jack"
 
+#include <errno.h>
 #include <unistd.h>
 #include <jack/jack.h>
 #include <deadbeef/deadbeef.h>
@@ -20,31 +22,41 @@
 //#define trace(...) { fprintf(stderr, __VA_ARGS__); }
 #define trace(fmt,...)
 
+typedef struct {
+    jack_client_t *client;
+    jack_status_t status;
+    const char *name;
+    char active;
+    char autorestart;
+    char autostart;
+    char autoconnect;
+    char connect;
+    ddb_waveformat_t *fmt;
+    unsigned short state;
+    jack_port_t   *ports[];
+} ddb_client_t;
+
 static DB_output_t plugin;
-DB_functions_t *deadbeef;
+static DB_functions_t *ddb_api;
+static ddb_client_t ddb_client = {
+    .name        = DB_CLIENT_NAME,
+    .active      = 0,
+    .autostart   = 1,
+    .autoconnect = 1,
+    .autorestart = 1,
+    .connect     = 0,
+    .fmt         = &plugin.fmt,
+};
 
-static jack_client_t *ch; // client handle
-static jack_status_t jack_status;
-static jack_port_t *jack_ports[2]; // FIXME: this magic number is a hack to
-                                   //        get it to build. must replace
-                                   //        this with number of channels!
-static unsigned short state;
-static short errcode; // used to store error codes
-static short jack_connected = 0;
-static short DidWeStartJack = 0;
-static int rate;
+static int ddb_playback_stop (void);
+static int ddb_jack_init (void);
 
-static int
-jack_stop (void);
+static int jack_proc_callback (jack_nframes_t nframes, void *arg)
+{
+    trace (__func__);
+    ddb_client_t *dbc = arg;
 
-static int
-jack_init (void);
-
-static int
-jack_proc_callback (jack_nframes_t nframes, void *arg) {
-    trace ("jack_proc_callback\n");
-    if (!jack_connected) return -1;
-    trace ("jack_connected was true\n");
+    if (!dbc->connect) return EPERM;
 
     // FIXME: This function copies from the streamer to a local buffer,
     //        and then to JACK's buffer. This is wasteful.
@@ -55,15 +67,15 @@ jack_proc_callback (jack_nframes_t nframes, void *arg) {
     //        outputs both channels multiplexed, whereas JACK expects
     //        each channel to be written to a separate buffer.
 
-    switch (state) {
+    switch (dbc->state) {
         case OUTPUT_STATE_PLAYING: {
-            char buf[nframes * plugin.fmt.channels * (plugin.fmt.bps / CHAR_BIT)];
-            unsigned bytesread = deadbeef->streamer_read (buf, sizeof(buf));
+            char buf[nframes * dbc->fmt->channels * (dbc->fmt->bps / CHAR_BIT)];
+            unsigned bytesread = ddb_api->streamer_read (buf, sizeof(buf));
 
-	    // this avoids a crash if we are playing and change to a plugin
-	    // with no valid output and then switch back
+        // this avoids a crash if we are playing and change to a plugin
+        // with no valid output and then switch back
             if (bytesread == -1) {
-                state = OUTPUT_STATE_STOPPED;
+                dbc->state = OUTPUT_STATE_STOPPED;
                 return 0;
             }
 
@@ -71,22 +83,22 @@ jack_proc_callback (jack_nframes_t nframes, void *arg) {
             // inadequate read from streamer
 /*            while (bytesread < sizeof(buf)) {
                 //usleep (100);
-                unsigned morebytesread = deadbeef->streamer_read (buf+bytesread, sizeof(buf)-bytesread);
+                unsigned morebytesread = ddb_api->streamer_read (buf+bytesread, sizeof(buf)-bytesread);
                 if (morebytesread != -1) bytesread += morebytesread;
             } */
 
-            jack_nframes_t framesread = bytesread / (plugin.fmt.channels * (plugin.fmt.bps / CHAR_BIT));
-            float *jack_port_buffer[plugin.fmt.channels];
-            for (unsigned short i = 0; i < plugin.fmt.channels; i++) {
-                jack_port_buffer[i] = jack_port_get_buffer(jack_ports[i], framesread);//nframes);
+            jack_nframes_t framesread = bytesread * CHAR_BIT / (dbc->fmt->channels * dbc->fmt->bps);
+            float *jack_port_buffer[dbc->fmt->channels];
+            for (unsigned short i = 0; i < dbc->fmt->channels; i++) {
+                jack_port_buffer[i] = jack_port_get_buffer(dbc->ports[i], framesread);//nframes);
             }
 
-            float vol = deadbeef->volume_get_amp ();
+            float vol = ddb_api->volume_get_amp ();
 
             for (unsigned i = 0; i < framesread; i++) {
-                for (unsigned short j = 0; j < plugin.fmt.channels; j++) {
+                for (unsigned short j = 0; j < dbc->fmt->channels; j++) {
                     // JACK expects floating point samples, so we need to convert from integer
-                    *jack_port_buffer[j]++ = ((float*)buf)[(plugin.fmt.channels*i) + j] * vol; // / 32768;
+                    *jack_port_buffer[j]++ = ((float*)buf)[(dbc->fmt->channels*i) + j] * vol; // / 32768;
                 }
             }
 
@@ -95,13 +107,13 @@ jack_proc_callback (jack_nframes_t nframes, void *arg) {
 
         // this is necessary to stop JACK going berserk when we pause/stop
         default: {
-            float *jack_port_buffer[plugin.fmt.channels];
-            for (unsigned short i = 0; i < plugin.fmt.channels; i++) {
-                jack_port_buffer[i] = jack_port_get_buffer(jack_ports[i], nframes);
+            float *jack_port_buffer[dbc->fmt->channels];
+            for (unsigned short i = 0; i < dbc->fmt->channels; i++) {
+                jack_port_buffer[i] = jack_port_get_buffer(dbc->ports[i], nframes);
             }
 
             for (unsigned i = 0; i < nframes; i++) {
-                for (unsigned short j = 0; j < plugin.fmt.channels; j++) {
+                for (unsigned short j = 0; j < dbc->fmt->channels; j++) {
                     *jack_port_buffer[j]++ = 0;
                 }
             }
@@ -111,102 +123,126 @@ jack_proc_callback (jack_nframes_t nframes, void *arg) {
     }
 }
 
-static int
-jack_rate_callback (void *arg) {
-    if (!jack_connected) return -1;
-    plugin.fmt.samplerate = (int)jack_get_sample_rate(ch);
+static int jack_rate_callback (void *arg)
+{
+    trace (__func__);
+    ddb_client_t *dbc = &ddb_client;
+
+    if (!dbc->connect)
+        return EPERM;
+    dbc->fmt->samplerate = (int)jack_get_sample_rate(dbc->client);
+
     return 0;
 }
 
-static int
-jack_shutdown_callback (void *arg) {
-    if (!jack_connected) return -1;
-    jack_connected = 0;
+static int jack_shutdown_callback (void *arg)
+{
+    trace (__func__);
+    ddb_client_t *dbc = arg;
+
+    if (!dbc->connect)
+        return EPERM;
+    dbc->connect = 0;
+
     // if JACK crashes or is shut down, start a new server instance
-    if (deadbeef->conf_get_int ("jack.autorestart", 0)) {
-        fprintf (stderr, "jack: JACK server shut down unexpectedly, restarting...\n");
+    if (dbc->autorestart) {
+        fprintf (stderr, "%s: JACK server shut down unexpectedly, restarting...\n", DB_PLUG_NAME);
         sleep (1);
-        jack_init ();
+        ddb_jack_init ();
     }
     else {
-        //fprintf (stderr, "jack: JACK server shut down unexpectedly, stopping playback\n");
-        //deadbeef->playback_stop ();
+        fprintf (stderr, "%s: JACK server shut down unexpectedly, stopping playback\n", DB_PLUG_NAME);
+        ddb_api->streamer_reset (1);
     }
+
     return 0;
 }
 
-static int
-jack_init (void) {
-    trace ("jack_init\n");
-    jack_connected = 1;
+static int ddb_jack_init (void)
+{
+    trace (__func__);
+    ddb_client_t *dbc = &ddb_client;
+
+    dbc->connect      = 1;
+    dbc->autorestart  = (char)ddb_api->conf_get_int("ddb_jack.autorestart", 1);
+    dbc->autostart    = (char)ddb_api->conf_get_int("ddb_jack.autostart"  , 1);
+    dbc->autoconnect  = (char)ddb_api->conf_get_int("ddb_jack.autoconnect", 1);
 
     // create new client on JACK server
-    if ((ch = jack_client_open (JACK_CLIENT_NAME, JackNullOption | (JackNoStartServer && !deadbeef->conf_get_int ("jack.autostart", 1)), &jack_status)) == 0) {
-        fprintf (stderr, "jack: could not connect to JACK server\n");
+    jack_options_t options = JackNullOption|(JackNoStartServer && !dbc->autostart);
+    dbc->client = jack_client_open (dbc->name, options, &dbc->status);
+    if (dbc->status & JackInitFailure) {
+        fprintf (stderr, "%s: Could not connect to JACK server\n", DB_PLUG_NAME);
         plugin.free();
-        return -1;
+        return EPERM;
     }
 
-    rate = (int)jack_get_sample_rate(ch);
+    dbc->fmt->samplerate = (int)jack_get_sample_rate(dbc->client);
 
     // Did we start JACK, or was it already running?
-    if (jack_status & JackServerStarted)
-        DidWeStartJack = 1;
+    if (dbc->status & JackServerStarted)
+        dbc->autostart = 1;
     else
-        DidWeStartJack = 0;
+        dbc->autostart = 0;
 
     // set process callback
-    if ((errcode = jack_set_process_callback(ch, &jack_proc_callback, NULL)) != 0) {
-        fprintf (stderr, "jack: could not set process callback, error %d\n", errcode);
+    if (jack_set_process_callback(dbc->client, &jack_proc_callback, dbc)) {
+        fprintf (stderr, "%s: Could not set process callback\n", DB_PLUG_NAME);
         plugin.free();
-        return -1;
+        return ESRCH;
     }
 
-    // set sample rate callback
-    if ((errcode = jack_set_sample_rate_callback(ch, (JackSampleRateCallback)&jack_rate_callback, NULL)) != 0) {
-        fprintf (stderr, "jack: could not set sample rate callback, error %d\n", errcode);
+    // set sample rate callback 
+    if (jack_set_sample_rate_callback(dbc->client, (JackSampleRateCallback)&jack_rate_callback, NULL)) {
+        fprintf (stderr, "%s: Could not set sample rate callback\n", DB_PLUG_NAME);
         plugin.free();
-        return -1;
+        return ESRCH;
     }
 
     // set shutdown callback
-    jack_on_shutdown (ch, (JackShutdownCallback)&jack_shutdown_callback, NULL);
+    jack_on_shutdown (dbc->client, (JackShutdownCallback)&jack_shutdown_callback, dbc);
 
     // register ports
-    for (unsigned short i=0; i < plugin.fmt.channels; i++) {
-        char port_name[11];
+    for (unsigned short i=0; i < dbc->fmt->channels; i++) {
+        char port_name[16];
 
         // i+1 used to adhere to JACK convention of counting ports from 1, not 0
-        sprintf (port_name, "deadbeef_%d", i+1);
-
-        if (!(jack_ports[i] = jack_port_register(ch, (const char*)&port_name, JACK_DEFAULT_AUDIO_TYPE, JackPortIsOutput|JackPortIsTerminal, 0))) {
-            fprintf (stderr, "jack: could not register port number %d\n", i+1);
+        sprintf (port_name, "ddb_playback_%d", i+1);
+        jack_options_t options = JackPortIsOutput|JackPortIsTerminal;
+        dbc->ports[i] = jack_port_register(dbc->client, (const char*)&port_name,
+                JACK_DEFAULT_AUDIO_TYPE, options, 0);
+        if (!dbc->ports[i]) {
+            fprintf (stderr, "%s: Could not register port number %d\n", DB_PLUG_NAME, i+1);
             plugin.free();
-            return -1;
+            return ENXIO;
         }
     }
 
     // tell JACK we are ready to roll
-    if ((errcode = jack_activate(ch)) != 0) {
-        fprintf (stderr, "jack: could not activate client, error %d\n", errcode);
+    if (jack_activate(dbc->client)) {
+        fprintf (stderr, "%s: Could not activate client\n", DB_PLUG_NAME);
         plugin.free();
-        return -1;
+        return EACCES;
     }
 
     // connect ports to hardware output
-    if (deadbeef->conf_get_int ("jack.autoconnect", 1)) {
+    if (dbc->autoconnect) {
         const char **playback_ports;
+        jack_options_t options = JackPortIsPhysical|JackPortIsInput;
 
-        if (!(playback_ports = jack_get_ports (ch, 0, 0, JackPortIsPhysical|JackPortIsInput))) {
-            fprintf (stderr, "jack: warning: could not find any playback ports to connect to\n");
+        if (!(playback_ports = jack_get_ports (dbc->client, 0, 0, options))) {
+            fprintf (stderr, "%s: Could not find any playback ports to connect to\n", DB_PLUG_NAME);
+            return ENXIO;
         }
         else {
-            for (unsigned short i=0; i < plugin.fmt.channels; i++) {
-                // error code 17 means port connection exists. We do not want to return an error in this case, simply proceed.
-                if ((errcode = jack_connect(ch, jack_port_name (jack_ports[i]), playback_ports[i])) && (errcode != 17)) {
-                    fprintf (stderr, "jack: could not create connection from %s to %s, error %d\n", jack_port_name (jack_ports[i]), playback_ports[i], errcode);
+            int ret;
+            for (unsigned short i=0; i < dbc->fmt->channels; i++) {
+                ret = jack_connect(dbc->client, jack_port_name (dbc->ports[i]),    playback_ports[i]);    
+                if (ret != 0 && ret != EEXIST) {
+                    fprintf (stderr, "%s: Could not create connection from %s to %s\n",
+                            DB_PLUG_NAME, jack_port_name (dbc->ports[i]), playback_ports[i]);
                     plugin.free();
-                    return -1;
+                    return EACCES;
                 }
             }
         }
@@ -215,49 +251,69 @@ jack_init (void) {
     return 0;
 }
 
-static int
-jack_setformat (ddb_waveformat_t *rate) {
-    // FIXME: If (and ONLY IF) we started JACK (i.e. DidWeStartJack == TRUE),
-    //        allow this to work by stopping and restarting JACK.
+static int ddb_jack_setformat(ddb_waveformat_t *fmt)
+{
+    trace (__func__);
+
+    /* Support only changing channels numbers */
+    if (plugin.fmt.channels == fmt->channels)
+        return 0;
+    else
+        plugin.fmt.channels = fmt->channels;
+
+    if (ddb_client.active) {
+        if (ddb_playback_stop())
+            return EPERM;
+        if (jack_client_close(ddb_client.client))
+            return ESRCH;
+        ddb_client.active = 0;
+    }
+    if(!ddb_jack_init())
+        return ENOEXEC;
+
     return 0;
 }
 
-static int
-jack_play (void) {
-    trace ("jack_play\n");
-    if (!jack_connected) {
-        if (jack_init() != 0) {
-            trace("jack_init failed\n");
+static int ddb_playback_play (void)
+{
+    trace (__func__);
+
+    if (!ddb_client.connect) {
+        if (ddb_jack_init()) {
             plugin.free();
-            return -1;
+            return EPERM;
         }
     }
-    state = OUTPUT_STATE_PLAYING;
+    ddb_client.state = OUTPUT_STATE_PLAYING;
+
     return 0;
 }
 
-static int
-jack_stop (void) {
-    trace ("jack_stop\n");
-    state = OUTPUT_STATE_STOPPED;
-    deadbeef->streamer_reset (1);
+static int ddb_playback_stop (void)
+{
+    trace (__func__);
+
+    ddb_client.state = OUTPUT_STATE_STOPPED;
+    ddb_api->streamer_reset (1);
+
     return 0;
 }
 
-static int
-jack_pause (void) {
-    trace ("jack_pause\n");
-    if (state == OUTPUT_STATE_STOPPED) {
-        return -1;
-    }
+static int ddb_playback_pause (void)
+{
+    trace (__func__);
+
+    if (ddb_client.state == OUTPUT_STATE_STOPPED)
+        return 0;
     // set pause state
-    state = OUTPUT_STATE_PAUSED;
+    ddb_client.state = OUTPUT_STATE_PAUSED;
+
     return 0;
 }
 
-static int
-jack_plugin_start (void) {
-    trace ("jack_plugin_start\n");
+static int ddb_jack_start (void)
+{
+    trace (__func__);
     sigset_t set;
     sigemptyset (&set);
     sigaddset (&set, SIGPIPE);
@@ -265,55 +321,56 @@ jack_plugin_start (void) {
     return 0;
 }
 
-static int
-jack_plugin_stop (void) {
-    trace ("jack_plugin_stop\n");
+static int ddb_jack_stop (void)
+{
+    trace (__func__);
     return 0;
 }
 
-static int
-jack_unpause (void) {
-    trace ("jack_unpause\n");
-    jack_play ();
+static int ddb_playback_unpause (void)
+{
+    trace (__func__);
+    ddb_playback_play ();
     return 0;
 }
 
-static int
-jack_get_state (void) {
-    trace ("jack_get_state\n");
-    return state;
+static int ddb_playback_state (void)
+{
+    trace (__func__);
+    return ddb_client.state;
 }
 
-static int
-jack_free_deadbeef (void) {
-    trace ("jack_free_deadbeef\n");
-    jack_connected = 0;
+static int ddb_jack_free (void)
+{
+    trace (__func__);
+    ddb_client.connect = 0;
 
     // stop playback if we didn't start jack
     // this prevents problems with not disconnecting gracefully
-    if (!DidWeStartJack) {
-        jack_stop ();
+    if (!ddb_client.autostart) {
+        ddb_playback_stop ();
         sleep (1);
     }
 
-    if (ch) {
-        if (jack_client_close (ch)) {
-            fprintf (stderr, "jack: could not disconnect from JACK server\n");
-            return -1;
+    if (ddb_client.client) {
+        if (jack_client_close (ddb_client.client)) {
+            fprintf (stderr, "%s: Could not disconnect from JACK server\n", DB_PLUG_NAME);
+            return EPERM;
         }
-        ch = NULL;
+        ddb_client.client = NULL;
     }
 
     // sleeping here is necessary to give JACK time to disconnect from the backend
     // if we are switching to another backend, it will fail without this
-    if (DidWeStartJack)
+    if (ddb_client.autostart)
         sleep (1);
+
     return 0;
 }
 
-DB_plugin_t *
-jack_load (DB_functions_t *api) {
-    deadbeef = api;
+DB_plugin_t * ddb_jack_load (DB_functions_t *api)
+{
+    ddb_api = api;
     return DB_PLUGIN (&plugin);
 }
 
@@ -327,27 +384,24 @@ static const char settings_dlg[] =
 static DB_output_t plugin = {
     DB_PLUGIN_SET_API_VERSION
     .plugin.version_major = 0,
-    .plugin.version_minor = 2,
-    //.plugin.nostop = 0,
+    .plugin.version_minor = 3,
     .plugin.type = DB_PLUGIN_OUTPUT,
-    .plugin.id = "jack",
+    .plugin.id = DB_PLUG_NAME,
     .plugin.name = "JACK output plugin",
     .plugin.descr = "plays sound via JACK API",
-    .plugin.copyright = "Copyright (C) 2010-2011 Steven McDonald <steven.mcdonald@     libremail.me>",
-//    .plugin.author = "Steven McDonald",
-//    .plugin.email = "steven.mcdonald@libremail.me",
-    .plugin.website = "http://gitorious.org/deadbeef-sm-plugins/pages/Home",
-    .plugin.start = jack_plugin_start,
-    .plugin.stop = jack_plugin_stop,
+    .plugin.copyright = "CopyLeft (C) 2014 -tclover <tokiclover@gmail.com>",
+    .plugin.website = "https://github.com/tokiclover/deadbeef-plugins-jack",
+    .plugin.start = ddb_jack_start,
+    .plugin.stop = ddb_jack_stop,
     .plugin.configdialog = settings_dlg,
-    .init = jack_init,
-    .free = jack_free_deadbeef,
-    .setformat = jack_setformat,
-    .play = jack_play,
-    .stop = jack_stop,
-    .pause = jack_pause,
-    .unpause = jack_unpause,
-    .state = jack_get_state,
+    .init = ddb_jack_init,
+    .free = ddb_jack_free,
+    .setformat = ddb_jack_setformat,
+    .play = ddb_playback_play,
+    .stop = ddb_playback_stop,
+    .pause = ddb_playback_pause,
+    .unpause = ddb_playback_unpause,
+    .state = ddb_playback_state,
     .fmt = {
         .bps = 32,
         .is_float = 1,
@@ -357,3 +411,7 @@ static DB_output_t plugin = {
     },
     .has_volume = 1,
 };
+
+/*
+ * vim:fenc=utf-8:expandtab:sts=4:sw=4:ts=4:
+ */
