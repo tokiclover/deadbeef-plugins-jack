@@ -1,8 +1,9 @@
 /*
-    JACK output plugin for DeaDBeeF
-    Copyright (C) 2010 Steven McDonald <steven.mcdonald@libremail.me>
-    See COPYING file for modification and redistribution conditions.
-*/
+ * JACK output plugin for DeaDBeeF
+ * Copyright (C) 2010 Steven McDonald <steven.mcdonald@libremail.me>
+ * CopyLeft  (c) 2014 -tclover <tokiclover@gmail.com>
+ * License: MIT (see COPYING file).
+ */
 
 #define _GNU_SOURCE
 #ifdef HAVE_CONFIG_H
@@ -237,7 +238,7 @@ static int ddb_jack_init (void)
         else {
             int ret;
             for (unsigned short i=0; i < dbc->fmt->channels; i++) {
-                ret = jack_connect(dbc->client, jack_port_name (dbc->ports[i]),    playback_ports[i]);    
+                ret = jack_connect(dbc->client, jack_port_name (dbc->ports[i]), playback_ports[i]); 
                 if (ret != 0 && ret != EEXIST) {
                     fprintf (stderr, "%s: Could not create connection from %s to %s\n",
                             DB_PLUG_NAME, jack_port_name (dbc->ports[i]), playback_ports[i]);
