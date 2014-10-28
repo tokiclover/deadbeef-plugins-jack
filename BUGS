@@ -1,0 +1,4 @@
+---
+This plugin has actually a flaw because it does make a copy of jack ports buffer
+because of the lack of a proper multi channels streaming suport in deadbeef.
+---
