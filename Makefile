@@ -1,15 +1,15 @@
 PKG_NAME = ddb_jack
 
 PREFIX  ?= /usr/local
-LIBDIR  ?= ${DESTDIR}${PREFIX}/lib
+LIBDIR  ?= $(PREFIX)/lib
 
 CC     ?= gcc
-CFLAGS += -I$(shell pkg-config --variables=includedir jack)
+CFLAGS += -I$(shell pkg-config --variable=includedir jack)
 LDLIBS += $(shell pkg-config --libs jack)
 
 all:
-	$(CC) $(CFLAGS) -std=c99 -shared -o $(PKG_NAME).so $(LDLIBS) $(PKG_NAME).c -fPIC -Wall $(LDFLAGS)
+	$(CC) -std=c99 -shared $(CFLAGS) -o $(PKG_NAME).so $(LDLIBS) $(PKG_NAME).c -fPIC -Wall $(LDFLAGS)
 
 install:
-	install -D -m 755 $(PKG_NAME).so $(LIBDIR)/deadbeef/$(PKG_NAME).so
+	install -D -m 755 $(PKG_NAME).so $(DESTDIR)$(LIBDIR)/deadbeef/$(PKG_NAME).so
 
